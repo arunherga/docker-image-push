@@ -1,32 +1,68 @@
-name: Build and Push Docker Image
+name: Build and push Docker image
 
 on:
   push:
-    branches:
-      - main  # Adjust branch as needed
+    branches: [main]
+    tags: ["v*"]
   pull_request:
-    branches:
-      - main
+    branches: [main]
+  workflow_dispatch:
+
+# One build per ref; a new push supersedes an in-flight one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
-  build-and-push:
+  build:
     runs-on: ubuntu-latest
-
+    permissions:
+      contents: read
+      packages: write        # push to GHCR
+      attestations: write    # provenance for the pushed image
+      id-token: write
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Check out the repository
+        uses: actions/checkout@v7
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # Skipped on pull requests: a PR build is verified, never published.
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
         with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build Docker image
-        run: docker build -t my-docker-image:latest .
+      - name: Derive image tags and labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Tag Docker image
-        run: docker tag my-docker-image:latest my-dockerhub-username/my-docker-image:latest
-
-      - name: Push Docker image
-        run: docker push my-dockerhub-username/my-docker-image:latest
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
